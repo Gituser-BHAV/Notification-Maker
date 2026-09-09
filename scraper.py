@@ -23,6 +23,7 @@ DB_FILE = "jobs.db"
 EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS")
 EMAIL_APP_PASSWORD = os.environ.get("EMAIL_APP_PASSWORD")
 TO_EMAIL = os.environ.get("TO_EMAIL")
+TEST_URL = os.environ.get("TEST_URL")
 
 HEADERS = {
     "User-Agent": (
@@ -1731,8 +1732,101 @@ def send_email(job):
 # ============================================================
 # MAIN
 # ============================================================
+def test_single_url(url):
+    print("=" * 60)
+    print("TEST MODE")
+    print("=" * 60)
+    print(f"Testing URL:\n{url}")
+    print()
+
+    page = fetch_page(url)
+
+    if not page:
+        print("Could not fetch the page.")
+        return
+
+    try:
+        job = extract_job_page(url, page)
+
+        print(f"Job Name:\n{job['title']}")
+        print()
+
+        print(f"Organization:\n{job['organization']}")
+        print()
+
+        print(f"Total Vacancies:\n{job['vacancies']}")
+        print()
+
+        print("Eligibility Criteria:")
+
+        for item in job["eligibility"]:
+            print(f"  • {item}")
+
+        print()
+
+        print(f"Application Fee:\n{job['fee']}")
+        print()
+
+        print(f"Application Start Date:\n{job['start_date']}")
+        print()
+
+        print(f"Last Date:\n{job['last_date']}")
+        print()
+
+        print(f"Fee Payment Date:\n{job['fee_date']}")
+        print()
+
+        print(f"Correction Date:\n{job['correction_date']}")
+        print()
+
+        print(f"Exam Date:\n{job['exam_date']}")
+        print()
+
+        print(f"Admit Card:\n{job['admit_card']}")
+        print()
+
+        print(f"Result:\n{job['result_date']}")
+        print()
+
+        print(f"Apply Online:\n{job['apply']}")
+        print()
+
+        print(f"Official Notification:\n{job['notification']}")
+        print()
+
+        print(f"Online Correction:\n{job['correction']}")
+        print()
+
+        print(f"Official Website:\n{job['website']}")
+        print()
+
+        print(f"Job Page:\n{job['job_page']}")
+        print()
+
+        print("=" * 60)
+        print("TEST COMPLETE")
+        print("No email was sent.")
+        print("Database was not modified.")
+        print("=" * 60)
+
+    except Exception as e:
+        print(f"Test failed: {e}")
+
+
 
 def main():
+
+     # --------------------------------------------------------
+    # TEST MODE
+    # --------------------------------------------------------
+
+    if TEST_URL:
+        test_single_url(TEST_URL)
+        return
+
+    # --------------------------------------------------------
+    # NORMAL MODE
+    # --------------------------------------------------------
 
     print("=" * 60)
     print("Government Job Monitor")
