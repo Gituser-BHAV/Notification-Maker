@@ -2,163 +2,75 @@ import os
 import re
 import sqlite3
 import smtplib
+import html
 from datetime import datetime
-from email.message import EmailMessage
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from urllib.parse import urljoin, urlparse
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================
 
-LATEST_JOBS_URL = "https://sarkariresult.com.cm/latest-jobs/"
+BASE_URL = "https://sarkariresult.com.cm"
+LATEST_URL = f"{BASE_URL}/latest-jobs/"
 DB_FILE = "jobs.db"
 
-EMAIL_ADDRESS = os.environ["EMAIL_ADDRESS"]
-EMAIL_APP_PASSWORD = os.environ["EMAIL_APP_PASSWORD"]
-TO_EMAIL = os.environ["TO_EMAIL"]
+EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS")
+EMAIL_APP_PASSWORD = os.environ.get("EMAIL_APP_PASSWORD")
+TO_EMAIL = os.environ.get("TO_EMAIL")
 
-SITE_DOMAIN = "https://sarkariresult.com.cm/"
-
-
-# ============================================================
-# HTTP SESSION
-# ============================================================
-
-def get_session():
-    session = requests.Session()
-
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": (
-            "text/html,application/xhtml+xml,application/xml;"
-            "q=0.9,image/avif,image/webp,*/*;q=0.8"
-        ),
-        "Connection": "keep-alive",
-    })
-
-    return session
-
-
-def fetch_page(session, url):
-    print(f"Fetching: {url}")
-
-    response = session.get(
-        url,
-        timeout=30,
-        allow_redirects=True
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/139.0 Safari/537.36"
     )
+}
 
-    response.raise_for_status()
-
-    return response.text
-
-
-# ============================================================
-# TEXT / URL HELPERS
-# ============================================================
-
-def clean_text(text):
-    if not text:
-        return ""
-
-    text = text.replace("\xa0", " ")
-    text = re.sub(r"\s+", " ", text)
-
-    return text.strip()
-
-
-def clean_multiline_text(text):
-    if not text:
-        return ""
-
-    lines = []
-
-    for line in text.splitlines():
-        line = clean_text(line)
-
-        if line:
-            lines.append(line)
-
-    return "\n".join(lines)
-
-
-def absolute_url(base_url, href):
-    if not href:
-        return None
-
-    return urljoin(base_url, href.strip())
-
-
-def is_site_url(url):
-    if not url:
-        return False
-
-    parsed = urlparse(url)
-
-    return (
-        parsed.scheme in ("http", "https")
-        and parsed.netloc.endswith("sarkariresult.com.cm")
-    )
-
-
-def normalize_url(url):
-    if not url:
-        return None
-
-    return url.split("#")[0].strip()
+session = requests.Session()
+session.headers.update(HEADERS)
 
 
 # ============================================================
 # DATABASE
 # ============================================================
 
-def init_database():
+def init_db():
     conn = sqlite3.connect(DB_FILE)
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             url TEXT UNIQUE NOT NULL,
-            title TEXT NOT NULL,
-            first_seen TEXT NOT NULL,
-            email_sent INTEGER DEFAULT 0
+            title TEXT,
+            added_at TEXT
         )
     """)
 
     conn.commit()
-
     return conn
 
 
-def job_exists(conn, url):
-    result = conn.execute(
-        """
-        SELECT 1
-        FROM jobs
-        WHERE url = ?
-        LIMIT 1
-        """,
+def already_processed(conn, url):
+    row = conn.execute(
+        "SELECT 1 FROM jobs WHERE url = ? LIMIT 1",
         (url,)
     ).fetchone()
 
-    return result is not None
+    return row is not None
 
 
-def save_job(conn, title, url):
+def save_job(conn, url, title):
     conn.execute(
         """
         INSERT OR IGNORE INTO jobs
-        (url, title, first_seen, email_sent)
-        VALUES (?, ?, ?, 0)
+        (url, title, added_at)
+        VALUES (?, ?, ?)
         """,
         (
             url,
@@ -170,674 +82,366 @@ def save_job(conn, title, url):
     conn.commit()
 
 
-def mark_email_sent(conn, url):
-    conn.execute(
-        """
-        UPDATE jobs
-        SET email_sent = 1
-        WHERE url = ?
-        """,
-        (url,)
-    )
+# ============================================================
+# HTTP
+# ============================================================
 
-    conn.commit()
+def fetch_page(url):
+    try:
+        response = session.get(url, timeout=30)
+        response.raise_for_status()
+        return response.text
+
+    except Exception as e:
+        print(f"Failed to fetch {url}: {e}")
+        return None
 
 
 # ============================================================
-# LATEST JOBS PAGE
+# GENERAL TEXT HELPERS
 # ============================================================
 
-def get_job_links(html, base_url):
-    """
-    Finds job links under the "All Latest Jobs" section.
+def clean_text(text):
+    if not text:
+        return ""
 
-    The website contains many unrelated links, so we start
-    specifically from the All Latest Jobs heading.
-    """
+    text = html.unescape(text)
 
-    soup = BeautifulSoup(html, "html.parser")
+    text = text.replace("\xa0", " ")
+    text = text.replace("\u200b", "")
+    text = text.replace("\r", "\n")
 
-    links = []
+    lines = []
+
+    for line in text.split("\n"):
+        line = re.sub(r"\s+", " ", line).strip()
+
+        if line:
+            lines.append(line)
+
+    return "\n".join(lines)
+
+
+def one_line(text):
+    if not text:
+        return ""
+
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_label(text):
+    text = one_line(text).lower()
+
+    text = text.replace(":", "")
+    text = text.replace("-", " ")
+
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def unique_lines(lines):
+    result = []
     seen = set()
 
-    heading = None
+    for line in lines:
+        line = one_line(line)
 
-    for tag in soup.find_all(["h2", "h3", "h4"]):
-        text = clean_text(
-            tag.get_text(" ", strip=True)
-        )
+        if not line:
+            continue
 
-        if text.lower() == "all latest jobs":
-            heading = tag
-            break
+        key = line.lower()
 
-    if not heading:
-        print(
-            "WARNING: Could not find 'All Latest Jobs' heading."
-        )
+        if key not in seen:
+            seen.add(key)
+            result.append(line)
 
-        return []
+    return result
 
-    ignored_parts = [
-        "/contact",
-        "/privacy",
-        "/disclaimer",
-        "/author/",
-        "/category/",
-        "/feed/",
-        "/page/",
-        "/tag/",
-        "/search/",
+
+# ============================================================
+# MAIN ARTICLE
+# ============================================================
+
+def get_main_container(soup):
+    candidates = [
+        soup.select_one(".entry-content"),
+        soup.select_one(".post-content"),
+        soup.select_one(".td-post-content"),
+        soup.select_one("article"),
+        soup.select_one("main"),
     ]
 
-    for element in heading.find_all_next("a", href=True):
+    for candidate in candidates:
+        if candidate and len(candidate.get_text(" ", strip=True)) > 500:
+            return candidate
 
-        title = clean_text(
-            element.get_text(" ", strip=True)
-        )
-
-        href = element.get("href")
-
-        if not title or not href:
-            continue
-
-        url = absolute_url(base_url, href)
-
-        if not url:
-            continue
-
-        url = normalize_url(url)
-
-        if not is_site_url(url):
-            continue
-
-        if any(
-            part in url.lower()
-            for part in ignored_parts
-        ):
-            continue
-
-        if url.rstrip("/") == base_url.rstrip("/"):
-            continue
-
-        if url in seen:
-            continue
-
-        # Avoid navigation links such as Home, Latest Jobs, etc.
-        if len(title) < 10:
-            continue
-
-        # Avoid obvious non-job navigation text.
-        ignored_titles = {
-            "home",
-            "latest jobs",
-            "admit card",
-            "result",
-            "admission",
-            "syllabus",
-            "answer key",
-            "more",
-            "contact us",
-            "privacy policy",
-            "disclaimer",
-        }
-
-        if title.lower() in ignored_titles:
-            continue
-
-        seen.add(url)
-
-        links.append(
-            (
-                title,
-                url
-            )
-        )
-
-    return links
+    return soup
 
 
 # ============================================================
-# DOM SECTION HELPERS
+# HEADINGS
 # ============================================================
 
-def heading_matches(text, keywords):
-    text = clean_text(text).lower()
-
-    return any(
-        keyword.lower() in text
-        for keyword in keywords
-    )
+HEADING_TAGS = ["h1", "h2", "h3", "h4", "h5", "h6"]
 
 
-def get_heading_level(tag):
-    if not tag:
-        return 0
+def is_heading(tag):
+    if not isinstance(tag, Tag):
+        return False
 
-    match = re.match(
-        r"h([1-6])",
-        tag.name or "",
-        re.IGNORECASE
-    )
-
-    if match:
-        return int(match.group(1))
-
-    return 0
+    return tag.name in HEADING_TAGS
 
 
-def find_section_heading(soup, keywords):
+def heading_text(tag):
+    return one_line(tag.get_text(" ", strip=True))
+
+
+def find_heading(container, patterns):
     """
-    Finds headings such as:
-
-    Important Dates
-    Application Fee
-    Total Post
-    Eligibility Criteria
-    SOME USEFUL IMPORTANT LINKS
+    Finds a heading whose text matches one of the supplied patterns.
     """
 
-    for tag in soup.find_all(
-        ["h2", "h3", "h4", "h5", "h6"]
-    ):
-        text = clean_text(
-            tag.get_text(" ", strip=True)
-        )
+    patterns = [p.lower() for p in patterns]
 
-        if heading_matches(text, keywords):
-            return tag
+    for tag in container.find_all(HEADING_TAGS):
+        text = heading_text(tag).lower()
+
+        for pattern in patterns:
+            if pattern in text:
+                return tag
 
     return None
 
 
-def collect_section_nodes(soup, heading):
+# ============================================================
+# SECTION EXTRACTION
+# ============================================================
+
+def get_section_lines(container, heading, stop_keywords=None):
     """
-    Collect elements after a heading until another heading
-    of the same or higher level is encountered.
+    Extracts content after a heading until another heading is reached.
+
+    Unlike the older implementation, this does not rely on heading
+    levels. This prevents things such as Application Fee content
+    accidentally swallowing Age Limit/Post Details.
     """
 
     if not heading:
         return []
 
-    nodes = []
-
-    level = get_heading_level(heading)
-
-    for element in heading.find_all_next():
-
-        if element is heading:
-            continue
-
-        if element.name in [
-            "h1",
-            "h2",
-            "h3",
-            "h4",
-            "h5",
-            "h6"
-        ]:
-
-            next_level = get_heading_level(element)
-
-            if next_level <= level:
-                break
-
-        nodes.append(element)
-
-    return nodes
-
-
-def section_text(soup, keywords):
-    heading = find_section_heading(
-        soup,
-        keywords
-    )
-
-    if not heading:
-        return ""
-
-    nodes = collect_section_nodes(
-        soup,
-        heading
-    )
-
-    pieces = []
-
-    for node in nodes:
-
-        if node.name in [
-            "script",
-            "style",
-            "noscript",
-            "iframe"
-        ]:
-            continue
-
-        text = clean_text(
-            node.get_text(" ", strip=True)
-        )
-
-        if text:
-            pieces.append(text)
-
-    # Remove duplicates while preserving order.
-    unique = []
-
-    for piece in pieces:
-        if piece not in unique:
-            unique.append(piece)
-
-    return "\n".join(unique)
-
-
-# ============================================================
-# FIELD EXTRACTION
-# ============================================================
-
-def extract_label_value(text, labels):
-    """
-    Extracts the value immediately following a known label.
-
-    Example:
-
-    Online Apply Last Date : 07 October 2026
-
-    returns:
-
-    07 October 2026
-    """
-
-    if not text:
-        return "Not found"
-
-    for label in labels:
-
-        pattern = (
-            re.escape(label)
-            + r"\s*[:\-]?\s*"
-            r"(.+?)(?="
-            r"\s+(?:Online Apply|Last Date|"
-            r"Correction|Exam Date|Admit Card|"
-            r"Result|Application Fee|Total Post|"
-            r"Payment Mode)"
-            r"|$)"
-        )
-
-        match = re.search(
-            pattern,
-            text,
-            re.IGNORECASE
-        )
-
-        if match:
-            value = clean_text(
-                match.group(1)
-            )
-
-            if value:
-                return value
-
-    return "Not found"
-
-
-def extract_dates(soup):
-    """
-    Extracts dates from the Important Dates section.
-    """
-
-    text = section_text(
-        soup,
-        [
-            "Important Dates"
-        ]
-    )
-
-    if not text:
-        # Fallback: inspect the whole page.
-        text = clean_multiline_text(
-            soup.get_text("\n", strip=True)
-        )
-
-    start_date = extract_label_value(
-        text,
-        [
-            "Online Apply Start Date",
-            "Apply Online Start Date",
-            "Application Start Date",
-            "Start Date"
-        ]
-    )
-
-    last_date = extract_label_value(
-        text,
-        [
-            "Online Apply Last Date",
-            "Apply Online Last Date",
-            "Last Date for Apply Online",
-            "Last Date For Apply Online",
-            "Application Last Date",
-            "Last Date"
-        ]
-    )
-
-    fee_payment_date = extract_label_value(
-        text,
-        [
-            "Last Date For Fee Payment",
-            "Last Date for Fee Payment",
-            "Last Date Pay Exam Fee",
-            "Last Date For Payment"
-        ]
-    )
-
-    correction_date = extract_label_value(
-        text,
-        [
-            "Correction Date",
-            "Last Date Correction",
-            "Correction Last Date"
-        ]
-    )
-
-    exam_date = extract_label_value(
-        text,
-        [
-            "Exam Date"
-        ]
-    )
-
-    admit_card = extract_label_value(
-        text,
-        [
-            "Admit Card"
-        ]
-    )
-
-    result_date = extract_label_value(
-        text,
-        [
-            "Result Declared Date",
-            "Result Date"
-        ]
-    )
-
-    return {
-        "start_date": start_date,
-        "last_date": last_date,
-        "fee_payment_date": fee_payment_date,
-        "correction_date": correction_date,
-        "exam_date": exam_date,
-        "admit_card": admit_card,
-        "result_date": result_date
-    }
-
-
-# ============================================================
-# APPLICATION FEE
-# ============================================================
-
-def extract_application_fee(soup):
-    """
-    Extracts the complete Application Fee section.
-
-    This avoids the previous problem where regex stopped at
-    words such as "For".
-    """
-
-    heading = find_section_heading(
-        soup,
-        [
-            "Application Fee"
-        ]
-    )
-
-    if not heading:
-        return "Not found"
-
-    nodes = collect_section_nodes(
-        soup,
-        heading
-    )
+    stop_keywords = [
+        x.lower() for x in (stop_keywords or [])
+    ]
 
     lines = []
 
-    for node in nodes:
-
-        if node.name in [
-            "script",
-            "style",
-            "noscript",
-            "iframe"
-        ]:
-            continue
-
-        # Prefer individual list/table rows.
-        if node.name in [
-            "li",
-            "tr",
-            "p"
-        ]:
-
-            text = clean_text(
-                node.get_text(
-                    " ",
-                    strip=True
-                )
-            )
-
-            if not text:
-                continue
-
-            # Don't accidentally include unrelated sections.
-            if text.lower().startswith(
-                (
-                    "total post",
-                    "age limit",
-                    "eligibility",
-                    "how to fill",
-                    "mode of selection"
-                )
-            ):
-                continue
-
-            if text not in lines:
-                lines.append(text)
-
-    # If the DOM did not give useful lines,
-    # use section text as fallback.
-    if not lines:
-
-        text = section_text(
-            soup,
-            ["Application Fee"]
-        )
-
-        if text:
-            return clean_text(text)
-
-        return "Not found"
-
-    # Remove obvious payment-mode text from the fee field
-    # only if it is clearly separate.
-    filtered = []
-
-    for line in lines:
-
-        if line.lower().startswith(
-            "payment mode"
-        ):
-            continue
-
-        if line.lower() in [
-            "online",
-            "offline"
-        ]:
-            continue
-
-        filtered.append(line)
-
-    if not filtered:
-        return "Not found"
-
-    return "\n".join(filtered)
-
-
-# ============================================================
-# TOTAL VACANCIES
-# ============================================================
-
-def extract_total_vacancies(soup):
-    """
-    Extracts the value immediately associated with
-    the "Total Post" section.
-    """
-
-    heading = find_section_heading(
-        soup,
-        [
-            "Total Post",
-            "Total Posts"
-        ]
-    )
-
-    if not heading:
-        return "Not found"
-
-    # First inspect the immediate following elements.
     for element in heading.find_all_next():
 
-        if element.name in [
-            "h1",
-            "h2",
-            "h3",
-            "h4",
-            "h5",
-            "h6"
-        ]:
-            break
-
-        text = clean_text(
-            element.get_text(
-                " ",
-                strip=True
-            )
-        )
-
-        if not text:
+        if element == heading:
             continue
 
-        # Typical values:
-        # 2536 Posts
-        # 1700 Posts
-        # 2482 Posts
-        #
-        # Stop at the first sensible post count.
-        match = re.search(
-            r"\b([\d,]+)\s*(?:Posts?|Vacancies?)\b",
-            text,
-            re.IGNORECASE
+        if is_heading(element):
+            break
+
+        # Stop at common section markers even if the website uses
+        # unusual HTML instead of proper heading tags.
+        if isinstance(element, Tag):
+
+            text = one_line(element.get_text(" ", strip=True))
+
+            lower = text.lower()
+
+            if text and any(
+                lower.startswith(keyword)
+                for keyword in stop_keywords
+            ):
+                break
+
+            if element.name in ["p", "li"]:
+                if text:
+                    lines.append(text)
+
+            elif element.name == "tr":
+                cells = [
+                    one_line(c.get_text(" ", strip=True))
+                    for c in element.find_all(["td", "th"])
+                ]
+
+                cells = [c for c in cells if c]
+
+                if cells:
+                    lines.append(" | ".join(cells))
+
+    return unique_lines(lines)
+
+
+def get_section_text(container, heading, stop_keywords=None):
+    return "\n".join(
+        get_section_lines(
+            container,
+            heading,
+            stop_keywords
+        )
+    )
+
+
+# ============================================================
+# TITLE
+# ============================================================
+
+def extract_title(soup):
+    candidates = [
+        soup.select_one("h1"),
+        soup.select_one("h2"),
+    ]
+
+    for tag in candidates:
+        if tag:
+            text = one_line(tag.get_text(" ", strip=True))
+
+            if text and len(text) > 5:
+                return text
+
+    if soup.title:
+        title = one_line(soup.title.get_text())
+
+        title = re.sub(
+            r"\s*[-|]\s*Sarkari Result.*$",
+            "",
+            title,
+            flags=re.I
         )
 
-        if match:
-            return (
-                match.group(1)
-                + " Posts"
-            )
+        return title
 
-    # Fallback: inspect text immediately after heading.
-    parent = heading.parent
-
-    if parent:
-
-        text = clean_text(
-            parent.get_text(
-                " ",
-                strip=True
-            )
-        )
-
-        match = re.search(
-            r"\b([\d,]+)\s*(?:Posts?|Vacancies?)\b",
-            text,
-            re.IGNORECASE
-        )
-
-        if match:
-            return (
-                match.group(1)
-                + " Posts"
-            )
-
-    return "Not found"
+    return "New Job Notification"
 
 
 # ============================================================
 # ORGANIZATION
 # ============================================================
 
-def extract_organization(soup):
-    """
-    Extracts organization from the introductory paragraph.
+def extract_organization(container):
+    text = clean_text(
+        container.get_text("\n", strip=True)
+    )
 
-    Example:
+    patterns = [
+        r"^(.*?)\s+has released",
+        r"^(.*?)\s+has announced",
+        r"^(.*?)\s+invites",
+        r"^(.*?)\s+is inviting",
+    ]
 
-    Staff Selection Commission (SSC) has released a Notification...
-    """
+    for line in text.split("\n"):
 
-    # First inspect paragraphs.
-    for paragraph in soup.find_all("p"):
+        line = one_line(line)
 
-        text = clean_text(
-            paragraph.get_text(
-                " ",
-                strip=True
-            )
-        )
-
-        if not text:
-            continue
-
-        if "has released" in text.lower():
+        for pattern in patterns:
 
             match = re.search(
-                r"^(.+?)\s+has\s+released\b",
-                text,
-                re.IGNORECASE
+                pattern,
+                line,
+                re.I
             )
 
             if match:
 
-                organization = clean_text(
+                org = one_line(
                     match.group(1)
                 )
 
-                # Remove common unwanted prefixes.
-                organization = re.sub(
-                    r"^(Post Date.*?|SarkariResult\.com\.cm)\s+",
-                    "",
-                    organization,
-                    flags=re.IGNORECASE
-                )
+                if 3 < len(org) < 200:
+                    return org
 
-                if len(organization) > 2:
-                    return organization
-
-    # Fallback: use first relevant sentence from body text.
-    body_text = clean_multiline_text(
-        soup.get_text("\n", strip=True)
+    # Common fallback headings
+    heading = find_heading(
+        container,
+        [
+            "Organization",
+            "Department",
+            "Recruiting Organization"
+        ]
     )
 
-    match = re.search(
-        r"([A-Z][A-Za-z0-9 &(),./\-]{2,100})"
-        r"\s+has\s+released\b",
-        body_text,
-        re.IGNORECASE
-    )
-
-    if match:
-        return clean_text(
-            match.group(1)
+    if heading:
+        lines = get_section_lines(
+            container,
+            heading
         )
+
+        if lines:
+            return lines[0]
+
+    return "Not found"
+
+
+# ============================================================
+# TOTAL VACANCIES
+# ============================================================
+
+def extract_total_vacancies(container):
+    heading = find_heading(
+        container,
+        [
+            "Total Post",
+            "Total Posts",
+            "Total Vacancy",
+            "Total Vacancies",
+            "Number of Post"
+        ]
+    )
+
+    if heading:
+        lines = get_section_lines(
+            container,
+            heading,
+            stop_keywords=[
+                "education qualification",
+                "educational qualification",
+                "eligibility",
+                "age limit",
+                "application fee",
+                "important date",
+                "important dates",
+                "post details",
+            ]
+        )
+
+        for line in lines:
+
+            if re.search(
+                r"\d[\d,]*\s*(posts?|vacancies?)",
+                line,
+                re.I
+            ):
+                return line
+
+            if re.fullmatch(
+                r"[\d,]+",
+                line
+            ):
+                return f"{line} Posts"
+
+    # Search nearby text as fallback
+    text = clean_text(
+        container.get_text("\n", strip=True)
+    )
+
+    patterns = [
+        r"Total\s+(?:Post|Posts|Vacancy|Vacancies)\s*[:\-]?\s*([\d,]+)",
+        r"([\d,]+)\s+(?:Posts|Vacancies)",
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            text,
+            re.I
+        )
+
+        if match:
+            return f"{match.group(1)} Posts"
 
     return "Not found"
 
@@ -846,678 +450,1266 @@ def extract_organization(soup):
 # ELIGIBILITY
 # ============================================================
 
-def extract_eligibility(soup):
-    """
-    Extracts eligibility primarily from tables.
-
-    This is much more reliable than regex against the complete
-    flattened webpage text.
-    """
-
-    heading = find_section_heading(
-        soup,
+def extract_eligibility(container):
+    heading = find_heading(
+        container,
         [
             "Eligibility Criteria",
-            "Eligibility"
+            "Eligibility",
+            "Education Qualification",
+            "Educational Qualification",
+            "Educational Qualification Details",
+            "Qualification"
         ]
     )
 
-    # --------------------------------------------------------
-    # Strategy 1: Find table after eligibility heading
-    # --------------------------------------------------------
+    lines = []
 
     if heading:
 
-        nodes = collect_section_nodes(
-            soup,
-            heading
+        lines = get_section_lines(
+            container,
+            heading,
+            stop_keywords=[
+                "age limit",
+                "application fee",
+                "important date",
+                "important dates",
+                "post details",
+                "selection process",
+                "how to apply",
+                "some useful",
+                "you may also check",
+                "useful important links",
+                "important links",
+                "faq",
+            ]
         )
 
-        for node in nodes:
+    # Tables are particularly important for SSC-style pages.
+    if heading:
 
-            if node.name != "table":
-                continue
+        table = heading.find_next("table")
 
-            rows = node.find_all("tr")
+        if table:
 
-            if not rows:
-                continue
+            for row in table.find_all("tr"):
 
-            result = []
-
-            for row in rows:
-
-                cells = row.find_all(
-                    ["th", "td"]
-                )
-
-                values = [
-                    clean_text(
+                cells = [
+                    one_line(
                         cell.get_text(
                             " ",
                             strip=True
                         )
                     )
-                    for cell in cells
+                    for cell in row.find_all(
+                        ["td", "th"]
+                    )
                 ]
 
-                values = [
-                    value
-                    for value in values
-                    if value
+                cells = [
+                    c for c in cells
+                    if c
                 ]
 
-                if not values:
-                    continue
+                if cells:
+                    lines.append(
+                        " | ".join(cells)
+                    )
 
-                result.append(values)
+    lines = unique_lines(lines)
 
-            if result:
+    # Remove obvious non-eligibility contamination.
+    filtered = []
 
-                # Format two-column eligibility table.
-                formatted = []
+    bad_patterns = [
+        r"^application fee",
+        r"^age limit",
+        r"^minimum age",
+        r"^maximum age",
+        r"^post details",
+        r"^important dates?",
+        r"^selection process",
+        r"^how to apply",
+    ]
 
-                for row in result:
+    for line in lines:
 
-                    if len(row) >= 2:
-
-                        post_name = row[0]
-                        criteria = " ".join(
-                            row[1:]
-                        )
-
-                        # Skip header.
-                        if (
-                            post_name.lower()
-                            in [
-                                "post name",
-                                "post",
-                                "name"
-                            ]
-                            and
-                            "eligibility"
-                            in criteria.lower()
-                        ):
-                            continue
-
-                        formatted.append(
-                            f"{post_name}: {criteria}"
-                        )
-
-                    else:
-
-                        value = row[0]
-
-                        if value.lower() not in [
-                            "post name",
-                            "eligibility criteria"
-                        ]:
-                            formatted.append(value)
-
-                if formatted:
-                    return "\n".join(formatted)
-
-    # --------------------------------------------------------
-    # Strategy 2: Look for any table containing eligibility
-    # --------------------------------------------------------
-
-    for table in soup.find_all("table"):
-
-        table_text = clean_text(
-            table.get_text(
-                " ",
-                strip=True
+        if any(
+            re.search(
+                pattern,
+                line,
+                re.I
             )
-        )
-
-        if "eligibility criteria" not in table_text.lower():
+            for pattern in bad_patterns
+        ):
             continue
 
-        rows = table.find_all("tr")
+        filtered.append(line)
 
-        formatted = []
+    if filtered:
+        return filtered
 
-        for row in rows:
+    return ["Not found"]
 
-            cells = row.find_all(
-                ["th", "td"]
-            )
 
-            values = [
-                clean_text(
-                    cell.get_text(
-                        " ",
-                        strip=True
-                    )
-                )
-                for cell in cells
-            ]
+# ============================================================
+# APPLICATION FEE
+# ============================================================
 
-            values = [
-                value
-                for value in values
-                if value
-            ]
+def extract_application_fee(container):
+    heading = find_heading(
+        container,
+        [
+            "Application Fee",
+            "Application Fees",
+            "Exam Fee"
+        ]
+    )
 
-            if len(values) >= 2:
+    if not heading:
+        return "Not found"
 
-                if (
-                    values[0].lower()
-                    == "post name"
-                ):
-                    continue
+    lines = get_section_lines(
+        container,
+        heading,
+        stop_keywords=[
+            "age limit",
+            "minimum age",
+            "maximum age",
+            "age relaxation",
+            "post details",
+            "education qualification",
+            "educational qualification",
+            "eligibility",
+            "important date",
+            "important dates",
+            "selection process",
+            "how to apply",
+            "some useful",
+            "useful important links",
+        ]
+    )
 
-                formatted.append(
-                    f"{values[0]}: "
-                    f"{' '.join(values[1:])}"
-                )
+    valid = []
 
-        if formatted:
-            return "\n".join(formatted)
+    for line in lines:
 
-    # --------------------------------------------------------
-    # Strategy 3: Text fallback
-    # --------------------------------------------------------
+        lower = line.lower()
 
-    if heading:
+        # Explicit no-fee statements
+        if (
+            "no application fee" in lower
+            or "no fee" in lower
+            or "application fee is nil" in lower
+            or "fee is nil" in lower
+        ):
+            valid.append(line)
+            continue
 
-        text = section_text(
-            soup,
-            [
-                "Eligibility Criteria",
-                "Eligibility"
-            ]
-        )
+        # Fee lines normally contain ₹, Rs, INR, or fee-related wording.
+        if (
+            "₹" in line
+            or "rs." in lower
+            or "rs " in lower
+            or "inr" in lower
+            or "fee" in lower
+        ):
+            # Avoid accidentally accepting age/post information.
+            if not re.search(
+                r"\bage\b|\bpost details\b|\bminimum age\b|\bmaximum age\b",
+                lower
+            ):
+                valid.append(line)
 
-        if text:
+    valid = unique_lines(valid)
 
-            # Remove common unrelated recommendation.
-            text = re.split(
-                r"You May Also Check\s*:",
-                text,
-                flags=re.IGNORECASE
-            )[0]
-
-            # Remove How To Fill if it was included.
-            text = re.split(
-                r"How To Fill",
-                text,
-                flags=re.IGNORECASE
-            )[0]
-
-            text = clean_text(text)
-
-            if text:
-                return text
+    if valid:
+        return "\n".join(valid)
 
     return "Not found"
+
+
+# ============================================================
+# DATES
+# ============================================================
+
+DATE_LABELS = {
+    "start": [
+        "application start date",
+        "application start",
+        "start date",
+        "online application start",
+        "form start date",
+    ],
+
+    "last": [
+        "last date",
+        "last date to apply",
+        "application last date",
+        "closing date",
+    ],
+
+    "fee": [
+        "fee payment last date",
+        "fee payment date",
+        "last date for fee payment",
+    ],
+
+    "correction": [
+        "correction date",
+        "correction window",
+        "online correction",
+        "application correction",
+    ],
+
+    "exam": [
+        "exam date",
+        "examination date",
+        "written exam date",
+    ],
+
+    "admit": [
+        "admit card",
+        "admit card date",
+    ],
+
+    "result": [
+        "result date",
+        "result",
+    ],
+}
+
+
+def find_label_value(lines, labels):
+    for i, line in enumerate(lines):
+
+        normalized = normalize_label(line)
+
+        for label in labels:
+
+            label_norm = normalize_label(label)
+
+            if normalized.startswith(label_norm):
+
+                value = line[
+                    len(label_norm):
+                ].strip(" :-")
+
+                if value:
+                    return value
+
+                if i + 1 < len(lines):
+                    return lines[i + 1]
+
+    return None
+
+
+def extract_dates(container):
+    result = {
+        "start": "Not found",
+        "last": "Not found",
+        "fee": "Not found",
+        "correction": "Not found",
+        "exam": "Not found",
+        "admit": "Not found",
+        "result": "Not found",
+    }
+
+    # First inspect Important Dates section.
+    heading = find_heading(
+        container,
+        [
+            "Important Dates",
+            "Important Date",
+            "Important Dates / Schedule",
+        ]
+    )
+
+    if heading:
+        lines = get_section_lines(
+            container,
+            heading,
+            stop_keywords=[
+                "application fee",
+                "age limit",
+                "eligibility",
+                "education qualification",
+                "how to apply",
+                "selection process",
+                "some useful",
+                "useful important links",
+            ]
+        )
+    else:
+        lines = clean_text(
+            container.get_text("\n", strip=True)
+        ).split("\n")
+
+    lines = unique_lines(lines)
+
+    for key, labels in DATE_LABELS.items():
+
+        value = find_label_value(
+            lines,
+            labels
+        )
+
+        if value:
+            result[key] = value
+
+    # --------------------------------------------------------
+    # Regex fallback for common date formats
+    # --------------------------------------------------------
+
+    all_text = "\n".join(lines)
+
+    date_pattern = (
+        r"\d{1,2}"
+        r"(?:st|nd|rd|th)?"
+        r"\s+"
+        r"[A-Za-z]+"
+        r"\s+"
+        r"\d{4}"
+    )
+
+    for line in lines:
+
+        dates = re.findall(
+            date_pattern,
+            line
+        )
+
+        if not dates:
+            continue
+
+        lower = line.lower()
+
+        if result["start"] == "Not found":
+            if "start" in lower:
+                result["start"] = dates[0]
+
+        if result["last"] == "Not found":
+            if "last date" in lower:
+                result["last"] = dates[-1]
+
+    # --------------------------------------------------------
+    # District-wise fallback
+    # --------------------------------------------------------
+
+    full_page = clean_text(
+        container.get_text("\n", strip=True)
+    )
+
+    district_wise = bool(
+        re.search(
+            r"district[\s\-]?wise",
+            full_page,
+            re.I
+        )
+    )
+
+    if district_wise:
+
+        if result["start"] == "Not found":
+            if re.search(
+                r"application.*district[\s\-]?wise",
+                full_page,
+                re.I
+            ):
+                result["start"] = "District Wise"
+
+        if result["last"] == "Not found":
+            if re.search(
+                r"last date.*district[\s\-]?wise",
+                full_page,
+                re.I
+            ):
+                result["last"] = "District Wise"
+
+        # Some pages simply say that dates are district-wise.
+        if (
+            result["start"] == "Not found"
+            and result["last"] == "Not found"
+            and re.search(
+                r"start.*district[\s\-]?wise",
+                full_page,
+                re.I
+            )
+        ):
+            result["start"] = "District Wise"
+            result["last"] = "District Wise"
+
+    return result
 
 
 # ============================================================
 # USEFUL LINKS
 # ============================================================
 
-def extract_useful_links(soup, base_url):
-    """
-    Extracts links from the "SOME USEFUL IMPORTANT LINKS"
-    section.
+def classify_link(label, href):
+    label = one_line(label).lower()
+    href = href.lower()
 
-    This prevents "Online Correction Link" from being
-    incorrectly selected as "Apply Online".
-    """
+    if (
+        "online correction" in label
+        or "correction" in label
+    ):
+        return "correction"
 
+    if (
+        "official notification" in label
+        or "download notification" in label
+        or "notification" in label
+    ):
+        return "notification"
+
+    if (
+        "official website" in label
+        or label.strip() == "official site"
+        or label.strip() == "website"
+    ):
+        return "website"
+
+    if (
+        "apply online" in label
+        or "registration" in label
+        or "login" in label
+        or "apply now" in label
+    ):
+        return "apply"
+
+    # URL-based fallback
+    if "registration" in href:
+        return "apply"
+
+    return None
+
+
+def extract_useful_links(container, job_url):
     result = {
-        "apply_link": None,
-        "notification_link": None,
-        "official_website": None,
-        "correction_link": None
+        "apply": "Not found",
+        "notification": "Not found",
+        "correction": "Not found",
+        "website": "Not found",
     }
 
-    heading = find_section_heading(
-        soup,
+    heading = find_heading(
+        container,
         [
             "SOME USEFUL IMPORTANT LINKS",
-            "USEFUL IMPORTANT LINKS",
-            "IMPORTANT LINKS"
+            "Useful Important Links",
+            "Important Links",
+            "Useful Links",
         ]
     )
 
-    if not heading:
-        return result
-
-    nodes = collect_section_nodes(
-        soup,
-        heading
-    )
-
-    current_label = ""
-
-    for node in nodes:
-
-        if node.name in [
-            "script",
-            "style",
-            "noscript",
-            "iframe"
-        ]:
-            continue
-
-        # ----------------------------------------------------
-        # Detect labels
-        # ----------------------------------------------------
-
-        if node.name in [
-            "h3",
-            "h4",
-            "h5",
-            "h6",
-            "strong",
-            "b",
-            "p",
-            "div",
-            "td"
-        ]:
-
-            text = clean_text(
-                node.get_text(
-                    " ",
-                    strip=True
-                )
-            )
-
-            lower = text.lower()
-
-            if "online correction" in lower:
-                current_label = "correction"
-
-            elif (
-                "apply online" in lower
-                or "online form" in lower
-                or "registration" in lower
-            ):
-                current_label = "apply"
-
-            elif (
-                "official notification" in lower
-                or "download notification" in lower
-                or "notification" == lower
-            ):
-                current_label = "notification"
-
-            elif (
-                "official website" in lower
-                or "ssc official website" in lower
-            ):
-                current_label = "website"
-
-        # ----------------------------------------------------
-        # Detect links
-        # ----------------------------------------------------
-
-        for anchor in node.find_all(
-            "a",
-            href=True
-        ):
-
-            href = anchor.get("href")
-
-            if not href:
-                continue
-
-            url = absolute_url(
-                base_url,
-                href
-            )
-
-            if not url:
-                continue
-
-            anchor_text = clean_text(
-                anchor.get_text(
-                    " ",
-                    strip=True
-                )
-            ).lower()
-
-            # Determine link type using both the current label
-            # and anchor text.
-            if current_label == "correction":
-
-                if not result["correction_link"]:
-                    result["correction_link"] = url
-
-            elif current_label == "apply":
-
-                if not result["apply_link"]:
-                    result["apply_link"] = url
-
-            elif current_label == "notification":
-
-                if not result["notification_link"]:
-                    result["notification_link"] = url
-
-            elif current_label == "website":
-
-                if not result["official_website"]:
-                    result["official_website"] = url
-
-            # Additional fallback based on anchor itself.
-            elif (
-                "apply online" in anchor_text
-                or "registration" in anchor_text
-            ):
-
-                if (
-                    "correction"
-                    not in anchor_text
-                    and not result["apply_link"]
-                ):
-                    result["apply_link"] = url
-
-            elif (
-                "official notification"
-                in anchor_text
-                or "download notification"
-                in anchor_text
-            ):
-
-                if not result["notification_link"]:
-                    result["notification_link"] = url
+    search_root = heading if heading else container
 
     # --------------------------------------------------------
-    # Final fallback: inspect all links inside section
+    # TABLE-FIRST APPROACH
     # --------------------------------------------------------
 
-    anchors = []
+    tables = []
 
-    for node in nodes:
+    if heading:
+        for table in heading.find_all_next("table"):
+            tables.append(table)
 
-        for anchor in node.find_all(
-            "a",
-            href=True
-        ):
+            # Usually useful-links table is small.
+            if len(tables) >= 3:
+                break
+    else:
+        tables = container.find_all("table")
 
-            url = absolute_url(
-                base_url,
-                anchor.get("href")
-            )
+    for table in tables:
 
-            text = clean_text(
-                anchor.get_text(
+        for row in table.find_all("tr"):
+
+            anchors = row.find_all("a", href=True)
+
+            if not anchors:
+                continue
+
+            row_text = one_line(
+                row.get_text(
                     " ",
                     strip=True
                 )
-            ).lower()
+            )
 
-            if url:
-                anchors.append(
-                    (
-                        text,
-                        url
+            for anchor in anchors:
+
+                href = urljoin(
+                    job_url,
+                    anchor.get("href")
+                )
+
+                anchor_text = one_line(
+                    anchor.get_text(
+                        " ",
+                        strip=True
                     )
                 )
 
-    for text, url in anchors:
+                label = (
+                    f"{row_text} "
+                    f"{anchor_text}"
+                )
 
-        if (
-            not result["apply_link"]
-            and (
-                "apply online" in text
-                or "registration" in text
-                or "login" in text
+                kind = classify_link(
+                    label,
+                    href
+                )
+
+                if kind:
+                    # Correction must never replace Apply Online.
+                    if kind == "correction":
+                        result["correction"] = href
+
+                    elif result[kind] == "Not found":
+                        result[kind] = href
+
+    # --------------------------------------------------------
+    # ANCHOR FALLBACK
+    # --------------------------------------------------------
+
+    for anchor in search_root.find_all(
+        "a",
+        href=True
+    ):
+
+        href = urljoin(
+            job_url,
+            anchor.get("href")
+        )
+
+        text = one_line(
+            anchor.get_text(
+                " ",
+                strip=True
             )
-            and "correction" not in text
-        ):
-            result["apply_link"] = url
+        )
 
-        if (
-            not result["notification_link"]
-            and (
-                "official notification"
-                in text
-                or "download official"
-                in text
+        # Include nearby parent text.
+        parent_text = ""
+
+        if anchor.parent:
+            parent_text = one_line(
+                anchor.parent.get_text(
+                    " ",
+                    strip=True
+                )
             )
-        ):
-            result["notification_link"] = url
 
-        if (
-            not result["correction_link"]
-            and "correction" in text
-        ):
-            result["correction_link"] = url
+        label = (
+            f"{text} {parent_text}"
+        )
 
-        if (
-            not result["official_website"]
-            and "official website" in text
-        ):
-            result["official_website"] = url
+        kind = classify_link(
+            label,
+            href
+        )
+
+        if kind:
+
+            if kind == "correction":
+                result["correction"] = href
+
+            elif result[kind] == "Not found":
+                result[kind] = href
 
     return result
 
 
 # ============================================================
-# JOB TITLE
+# DISTRICT-WISE WEBSITE FALLBACK
 # ============================================================
 
-def extract_job_title(soup, fallback_title):
-    """
-    Extracts the actual H1 job title.
-    """
+def extract_official_website_from_text(container):
+    text = clean_text(
+        container.get_text("\n", strip=True)
+    )
 
-    h1 = soup.find("h1")
+    # Common "official website: URL" pattern
+    match = re.search(
+        r"official website\s*[:\-]?\s*(https?://[^\s]+)",
+        text,
+        re.I
+    )
 
-    if h1:
+    if match:
+        return match.group(1).rstrip(").,;")
 
-        title = clean_text(
-            h1.get_text(
-                " ",
-                strip=True
-            )
-        )
-
-        if title:
-            return title
-
-    title_tag = soup.find("title")
-
-    if title_tag:
-
-        title = clean_text(
-            title_tag.get_text(
-                " ",
-                strip=True
-            )
-        )
-
-        # Remove common website suffix.
-        title = re.sub(
-            r"\s*[-|]\s*Sarkari Result.*$",
-            "",
-            title,
-            flags=re.IGNORECASE
-        )
-
-        if title:
-            return title
-
-    return clean_text(fallback_title)
+    return None
 
 
 # ============================================================
 # JOB PAGE EXTRACTION
 # ============================================================
 
-def extract_job_page(html, url, fallback_title):
-    """
-    Parses an individual job page while preserving the DOM
-    structure for accurate extraction.
-    """
-
+def extract_job_page(url, html_content):
     soup = BeautifulSoup(
-        html,
+        html_content,
         "html.parser"
     )
 
-    title = extract_job_title(
-        soup,
-        fallback_title
+    container = get_main_container(
+        soup
+    )
+
+    title = extract_title(
+        soup
     )
 
     organization = extract_organization(
-        soup
-    )
-
-    dates = extract_dates(
-        soup
-    )
-
-    fee = extract_application_fee(
-        soup
+        container
     )
 
     vacancies = extract_total_vacancies(
-        soup
+        container
     )
 
     eligibility = extract_eligibility(
-        soup
+        container
     )
 
-    useful_links = extract_useful_links(
-        soup,
+    fee = extract_application_fee(
+        container
+    )
+
+    dates = extract_dates(
+        container
+    )
+
+    links = extract_useful_links(
+        container,
         url
     )
 
+    # Official website fallback
+    if links["website"] == "Not found":
+
+        website = extract_official_website_from_text(
+            container
+        )
+
+        if website:
+            links["website"] = website
+
+    # --------------------------------------------------------
+    # UP ANGanwadi-style fallback
+    # --------------------------------------------------------
+
+    page_text = clean_text(
+        container.get_text(
+            "\n",
+            strip=True
+        )
+    )
+
+    # If the page clearly states no application fee,
+    # prefer that over a contaminated section.
+    if re.search(
+        r"there is no application fee",
+        page_text,
+        re.I
+    ):
+        fee = "No application fee"
+
+    # If the page says application/last date is district-wise,
+    # ensure the email doesn't say Not found.
+    if re.search(
+        r"application.*district[\s\-]?wise",
+        page_text,
+        re.I
+    ):
+        if dates["start"] == "Not found":
+            dates["start"] = "District Wise"
+
+    if re.search(
+        r"last date.*district[\s\-]?wise",
+        page_text,
+        re.I
+    ):
+        if dates["last"] == "Not found":
+            dates["last"] = "District Wise"
+
     return {
         "title": title,
-        "url": url,
-
         "organization": organization,
-
         "vacancies": vacancies,
-
         "eligibility": eligibility,
-
         "fee": fee,
-
-        "start_date": dates["start_date"],
-        "last_date": dates["last_date"],
-        "fee_payment_date": dates["fee_payment_date"],
-        "correction_date": dates["correction_date"],
-        "exam_date": dates["exam_date"],
-        "admit_card": dates["admit_card"],
-        "result_date": dates["result_date"],
-
-        "apply_link": useful_links["apply_link"],
-        "notification_link": useful_links["notification_link"],
-        "correction_link": useful_links["correction_link"],
-        "official_website": useful_links["official_website"],
+        "start_date": dates["start"],
+        "last_date": dates["last"],
+        "fee_date": dates["fee"],
+        "correction_date": dates["correction"],
+        "exam_date": dates["exam"],
+        "admit_card": dates["admit"],
+        "result_date": dates["result"],
+        "apply": links["apply"],
+        "notification": links["notification"],
+        "correction": links["correction"],
+        "website": links["website"],
+        "job_page": url,
     }
 
 
 # ============================================================
-# EMAIL
+# LATEST JOB LINKS
 # ============================================================
 
-def format_value(value):
+def get_job_links():
+    html_content = fetch_page(
+        LATEST_URL
+    )
+
+    if not html_content:
+        return []
+
+    soup = BeautifulSoup(
+        html_content,
+        "html.parser"
+    )
+
+    links = []
+
+    # Find the "All Latest Jobs" area.
+    heading = find_heading(
+        soup,
+        [
+            "All Latest Jobs",
+            "Latest Jobs",
+        ]
+    )
+
+    if heading:
+
+        for element in heading.find_all_next():
+
+            if is_heading(element):
+                if element != heading:
+                    break
+
+            if not isinstance(element, Tag):
+                continue
+
+            if element.name != "a":
+                continue
+
+            href = element.get("href")
+
+            if not href:
+                continue
+
+            href = urljoin(
+                BASE_URL,
+                href
+            )
+
+            parsed = urlparse(href)
+
+            if parsed.netloc not in [
+                "",
+                urlparse(BASE_URL).netloc
+            ]:
+                continue
+
+            if href.rstrip("/") == LATEST_URL.rstrip("/"):
+                continue
+
+            if "/latest-jobs" in href.lower():
+                continue
+
+            if href not in links:
+                links.append(href)
+
+    # --------------------------------------------------------
+    # Fallback if heading structure changes
+    # --------------------------------------------------------
+
+    if not links:
+
+        for anchor in soup.find_all(
+            "a",
+            href=True
+        ):
+
+            href = urljoin(
+                BASE_URL,
+                anchor["href"]
+            )
+
+            parsed = urlparse(
+                href
+            )
+
+            if parsed.netloc != urlparse(BASE_URL).netloc:
+                continue
+
+            if href.rstrip("/") == LATEST_URL.rstrip("/"):
+                continue
+
+            if "/latest-jobs" in href.lower():
+                continue
+
+            if href not in links:
+                links.append(href)
+
+    print(
+        f"Found {len(links)} job links."
+    )
+
+    return links
+
+
+# ============================================================
+# EMAIL FORMATTING
+# ============================================================
+
+def html_escape(value):
+    return html.escape(
+        str(value)
+    )
+
+
+def format_eligibility(items):
+    if not items:
+        return "<li>Not found</li>"
+
+    result = []
+
+    for item in items:
+
+        # Convert table-style entries into readable text.
+        item = item.replace(
+            " | ",
+            " — "
+        )
+
+        result.append(
+            f"<li>{html_escape(item)}</li>"
+        )
+
+    return "\n".join(result)
+
+
+def format_multiline(value):
     if not value:
         return "Not found"
 
-    return value.strip()
+    lines = str(value).split("\n")
 
-
-def create_email(job):
-    """
-    Creates a clean notification email.
-
-    The previous FULL DETAILS dump has intentionally been
-    removed because the extracted page text was noisy and
-    duplicated information.
-    """
-
-    subject = (
-        f"New Job Alert: {job['title']}"
+    return "<br>".join(
+        html_escape(
+            line
+        )
+        for line in lines
+        if line.strip()
     )
 
-    body = f"""
-New job notification
 
-Job Name:
-{format_value(job['title'])}
+def build_email(job):
+    title = html_escape(
+        job["title"]
+    )
 
-Organization:
-{format_value(job['organization'])}
+    organization = html_escape(
+        job["organization"]
+    )
 
-Total Vacancies:
-{format_value(job['vacancies'])}
+    vacancies = html_escape(
+        job["vacancies"]
+    )
 
-Eligibility Criteria:
-{format_value(job['eligibility'])}
+    fee = format_multiline(
+        job["fee"]
+    )
 
-Application Fee:
-{format_value(job['fee'])}
+    start_date = html_escape(
+        job["start_date"]
+    )
 
-Application Start Date:
-{format_value(job['start_date'])}
+    last_date = html_escape(
+        job["last_date"]
+    )
 
-Last Date:
-{format_value(job['last_date'])}
+    fee_date = html_escape(
+        job["fee_date"]
+    )
 
-Last Date For Fee Payment:
-{format_value(job['fee_payment_date'])}
+    correction_date = html_escape(
+        job["correction_date"]
+    )
 
-Correction Date:
-{format_value(job['correction_date'])}
+    exam_date = html_escape(
+        job["exam_date"]
+    )
 
-Exam Date:
-{format_value(job['exam_date'])}
+    admit_card = html_escape(
+        job["admit_card"]
+    )
 
-Admit Card:
-{format_value(job['admit_card'])}
+    result_date = html_escape(
+        job["result_date"]
+    )
 
-Result Date:
-{format_value(job['result_date'])}
+    apply = job["apply"]
+    notification = job["notification"]
+    correction = job["correction"]
+    website = job["website"]
+    job_page = job["job_page"]
 
-Apply Online:
-{format_value(job['apply_link'])}
+    def link_or_text(
+        url,
+        label
+    ):
+        if (
+            url
+            and url != "Not found"
+            and url.startswith("http")
+        ):
+            return (
+                f'<a href="{html_escape(url)}" '
+                f'target="_blank">{html_escape(label)}</a>'
+            )
 
-Official Notification:
-{format_value(job['notification_link'])}
+        return html_escape(
+            url or "Not found"
+        )
 
-Online Correction:
-{format_value(job['correction_link'])}
+    return f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
 
-Official Website:
-{format_value(job['official_website'])}
+<style>
+body {{
+    margin: 0;
+    padding: 0;
+    background: #f4f6f8;
+    font-family: Arial, Helvetica, sans-serif;
+    color: #222;
+}}
 
-Official Notification / Job Page:
-{format_value(job['url'])}
+.container {{
+    max-width: 680px;
+    margin: 30px auto;
+    background: #ffffff;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 3px 14px rgba(0,0,0,0.08);
+}}
 
---------------------------------------------------
-This notification was automatically generated by your
-Sarkari Result job monitoring system.
+.header {{
+    padding: 24px;
+    background: #111827;
+    color: white;
+}}
+
+.header h1 {{
+    margin: 0;
+    font-size: 22px;
+}}
+
+.header p {{
+    margin: 7px 0 0;
+    opacity: 0.8;
+    font-size: 13px;
+}}
+
+.content {{
+    padding: 24px;
+}}
+
+.section {{
+    margin-bottom: 22px;
+}}
+
+.section-title {{
+    font-size: 15px;
+    font-weight: bold;
+    margin-bottom: 8px;
+    color: #111827;
+}}
+
+.value {{
+    font-size: 14px;
+    line-height: 1.6;
+}}
+
+ul {{
+    margin-top: 6px;
+    padding-left: 20px;
+}}
+
+li {{
+    margin-bottom: 7px;
+    line-height: 1.5;
+}}
+
+table {{
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14px;
+}}
+
+td {{
+    padding: 9px 0;
+    border-bottom: 1px solid #eeeeee;
+    vertical-align: top;
+}}
+
+td:first-child {{
+    width: 42%;
+    font-weight: bold;
+}}
+
+a {{
+    color: #2563eb;
+    text-decoration: none;
+}}
+
+.footer {{
+    padding: 18px 24px;
+    background: #f9fafb;
+    font-size: 12px;
+    color: #6b7280;
+}}
+</style>
+
+</head>
+
+<body>
+
+<div class="container">
+
+    <div class="header">
+        <h1>New Job Notification</h1>
+        <p>{title}</p>
+    </div>
+
+    <div class="content">
+
+        <div class="section">
+            <div class="section-title">
+                Job Name
+            </div>
+
+            <div class="value">
+                {title}
+            </div>
+        </div>
+
+
+        <div class="section">
+            <div class="section-title">
+                Organization
+            </div>
+
+            <div class="value">
+                {organization}
+            </div>
+        </div>
+
+
+        <div class="section">
+            <div class="section-title">
+                Total Vacancies
+            </div>
+
+            <div class="value">
+                {vacancies}
+            </div>
+        </div>
+
+
+        <div class="section">
+            <div class="section-title">
+                Eligibility Criteria
+            </div>
+
+            <ul>
+                {format_eligibility(job["eligibility"])}
+            </ul>
+        </div>
+
+
+        <div class="section">
+            <div class="section-title">
+                Application Fee
+            </div>
+
+            <div class="value">
+                {fee}
+            </div>
+        </div>
+
+
+        <div class="section">
+            <div class="section-title">
+                Important Dates
+            </div>
+
+            <table>
+
+                <tr>
+                    <td>Application Start</td>
+                    <td>{start_date}</td>
+                </tr>
+
+                <tr>
+                    <td>Last Date</td>
+                    <td>{last_date}</td>
+                </tr>
+
+                <tr>
+                    <td>Fee Payment</td>
+                    <td>{fee_date}</td>
+                </tr>
+
+                <tr>
+                    <td>Correction</td>
+                    <td>{correction_date}</td>
+                </tr>
+
+                <tr>
+                    <td>Exam Date</td>
+                    <td>{exam_date}</td>
+                </tr>
+
+                <tr>
+                    <td>Admit Card</td>
+                    <td>{admit_card}</td>
+                </tr>
+
+                <tr>
+                    <td>Result</td>
+                    <td>{result_date}</td>
+                </tr>
+
+            </table>
+        </div>
+
+
+        <div class="section">
+            <div class="section-title">
+                Useful Links
+            </div>
+
+            <table>
+
+                <tr>
+                    <td>Apply Online</td>
+                    <td>
+                        {link_or_text(
+                            apply,
+                            "Apply Online"
+                        )}
+                    </td>
+                </tr>
+
+                <tr>
+                    <td>Official Notification</td>
+                    <td>
+                        {link_or_text(
+                            notification,
+                            "Official Notification"
+                        )}
+                    </td>
+                </tr>
+
+                <tr>
+                    <td>Online Correction</td>
+                    <td>
+                        {link_or_text(
+                            correction,
+                            "Online Correction"
+                        )}
+                    </td>
+                </tr>
+
+                <tr>
+                    <td>Official Website</td>
+                    <td>
+                        {link_or_text(
+                            website,
+                            "Official Website"
+                        )}
+                    </td>
+                </tr>
+
+                <tr>
+                    <td>Job Page</td>
+                    <td>
+                        {link_or_text(
+                            job_page,
+                            "View Job Page"
+                        )}
+                    </td>
+                </tr>
+
+            </table>
+        </div>
+
+    </div>
+
+
+    <div class="footer">
+        Automated notification from your Government Job Monitor.
+    </div>
+
+</div>
+
+</body>
+</html>
 """
-
-    message = EmailMessage()
-
-    message["Subject"] = subject
-    message["From"] = EMAIL_ADDRESS
-    message["To"] = TO_EMAIL
-
-    message.set_content(
-        body.strip()
-    )
-
-    return message
 
 
 # ============================================================
 # EMAIL SENDING
 # ============================================================
 
-def send_email(message):
-    print("Connecting to Gmail...")
+def send_email(job):
+    if not EMAIL_ADDRESS:
+        raise RuntimeError(
+            "EMAIL_ADDRESS secret is missing."
+        )
+
+    if not EMAIL_APP_PASSWORD:
+        raise RuntimeError(
+            "EMAIL_APP_PASSWORD secret is missing."
+        )
+
+    if not TO_EMAIL:
+        raise RuntimeError(
+            "TO_EMAIL secret is missing."
+        )
+
+    message = MIMEMultipart(
+        "alternative"
+    )
+
+    message["From"] = EMAIL_ADDRESS
+    message["To"] = TO_EMAIL
+
+    message["Subject"] = (
+        f"New Job: {job['title']}"
+    )
+
+    body = build_email(
+        job
+    )
+
+    message.attach(
+        MIMEText(
+            body,
+            "html",
+            "utf-8"
+        )
+    )
 
     with smtplib.SMTP_SSL(
         "smtp.gmail.com",
@@ -1529,11 +1721,11 @@ def send_email(message):
             EMAIL_APP_PASSWORD
         )
 
-        server.send_message(
-            message
+        server.sendmail(
+            EMAIL_ADDRESS,
+            TO_EMAIL,
+            message.as_string()
         )
-
-    print("Email sent successfully.")
 
 
 # ============================================================
@@ -1542,218 +1734,137 @@ def send_email(message):
 
 def main():
 
-    print("=" * 70)
-    print("SARKARI RESULT JOB MONITOR")
-    print("=" * 70)
+    print("=" * 60)
+    print("Government Job Monitor")
+    print("=" * 60)
 
-    session = get_session()
+    conn = init_db()
 
-    conn = init_database()
+    links = get_job_links()
 
-    try:
+    if not links:
+        print(
+            "No job links found."
+        )
+        conn.close()
+        return
 
-        print("\nChecking:")
-        print(LATEST_JOBS_URL)
+    new_jobs = 0
 
-        latest_html = fetch_page(
-            session,
-            LATEST_JOBS_URL
+    for index, url in enumerate(
+        links,
+        start=1
+    ):
+
+        print()
+        print(
+            f"[{index}/{len(links)}] {url}"
         )
 
-        jobs = get_job_links(
-            latest_html,
-            LATEST_JOBS_URL
-        )
+        if already_processed(
+            conn,
+            url
+        ):
+            print(
+                "Already processed."
+            )
+            continue
 
         print(
-            f"\nFound {len(jobs)} possible job posts."
+            "New job detected."
         )
 
-        print("\nDetected jobs:")
+        page = fetch_page(
+            url
+        )
 
-        for title, url in jobs[:20]:
-
-            print(f"  - {title}")
-            print(f"    {url}")
-
-        new_jobs = 0
-
-        for index, (title, url) in enumerate(
-            jobs,
-            start=1
-        ):
-
-            print("\n" + "-" * 70)
-
+        if not page:
             print(
-                f"[{index}/{len(jobs)}] {title}"
+                "Could not fetch job page. "
+                "Will retry next run."
+            )
+            continue
+
+        try:
+
+            job = extract_job_page(
+                url,
+                page
             )
 
-            print(url)
+            print(
+                f"Title: {job['title']}"
+            )
+
+            print(
+                f"Organization: "
+                f"{job['organization']}"
+            )
+
+            print(
+                f"Vacancies: "
+                f"{job['vacancies']}"
+            )
+
+            print(
+                f"Start: "
+                f"{job['start_date']}"
+            )
+
+            print(
+                f"Last: "
+                f"{job['last_date']}"
+            )
 
             # ------------------------------------------------
-            # Existing job
+            # Send email FIRST.
+            # Save to DB only after successful email.
             # ------------------------------------------------
 
-            if job_exists(
+            print(
+                "Sending email..."
+            )
+
+            send_email(
+                job
+            )
+
+            print(
+                "Email sent successfully."
+            )
+
+            save_job(
                 conn,
-                url
-            ):
-
-                print(
-                    "Already processed."
-                )
-
-                continue
-
-            print(
-                "NEW JOB!"
+                url,
+                job["title"]
             )
 
-            # ------------------------------------------------
-            # Fetch job page
-            # ------------------------------------------------
+            print(
+                "Job saved to database."
+            )
 
-            try:
+            new_jobs += 1
 
-                job_html = fetch_page(
-                    session,
-                    url
-                )
+        except Exception as e:
 
-                job = extract_job_page(
-                    job_html,
-                    url,
-                    title
-                )
+            print(
+                f"Error processing job: {e}"
+            )
 
-                # ------------------------------------------------
-                # Display extracted information in GitHub log
-                # ------------------------------------------------
+            print(
+                "Job was NOT saved. "
+                "It will be retried next run."
+            )
 
-                print(
-                    f"Job: {job['title']}"
-                )
+    conn.close()
 
-                print(
-                    f"Organization: "
-                    f"{job['organization']}"
-                )
-
-                print(
-                    f"Vacancies: "
-                    f"{job['vacancies']}"
-                )
-
-                print(
-                    f"Eligibility: "
-                    f"{job['eligibility']}"
-                )
-
-                print(
-                    f"Fee: "
-                    f"{job['fee']}"
-                )
-
-                print(
-                    f"Start date: "
-                    f"{job['start_date']}"
-                )
-
-                print(
-                    f"Last date: "
-                    f"{job['last_date']}"
-                )
-
-                print(
-                    f"Fee payment date: "
-                    f"{job['fee_payment_date']}"
-                )
-
-                print(
-                    f"Correction date: "
-                    f"{job['correction_date']}"
-                )
-
-                print(
-                    f"Exam date: "
-                    f"{job['exam_date']}"
-                )
-
-                print(
-                    f"Apply link: "
-                    f"{job['apply_link']}"
-                )
-
-                print(
-                    f"Notification: "
-                    f"{job['notification_link']}"
-                )
-
-                print(
-                    f"Official website: "
-                    f"{job['official_website']}"
-                )
-
-                # ------------------------------------------------
-                # Create and send email
-                # ------------------------------------------------
-
-                email = create_email(
-                    job
-                )
-
-                send_email(
-                    email
-                )
-
-                # ------------------------------------------------
-                # Save ONLY after successful email
-                # ------------------------------------------------
-
-                save_job(
-                    conn,
-                    job["title"],
-                    url
-                )
-
-                mark_email_sent(
-                    conn,
-                    url
-                )
-
-                new_jobs += 1
-
-                print(
-                    "Job saved successfully."
-                )
-
-            except Exception as error:
-
-                print(
-                    f"ERROR processing job: "
-                    f"{error}"
-                )
-
-                # Continue processing other jobs.
-                continue
-
-    finally:
-
-        conn.close()
-
-    print("\n" + "=" * 70)
-
+    print()
+    print("=" * 60)
     print(
-        f"New jobs emailed: {new_jobs}"
+        f"Finished. New jobs emailed: {new_jobs}"
     )
+    print("=" * 60)
 
-    print("=" * 70)
-
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
     main()
