@@ -2,7 +2,6 @@ import os
 import re
 import sqlite3
 import smtplib
-import hashlib
 from datetime import datetime
 from email.message import EmailMessage
 from urllib.parse import urljoin
@@ -11,17 +10,12 @@ import requests
 from bs4 import BeautifulSoup
 
 
-# ---------------- CONFIGURATION ----------------
-
 LATEST_JOBS_URL = "https://sarkariresult.com.cm/latest-jobs/"
 DB_FILE = "jobs.db"
 
-# These are read from GitHub Actions secrets.
 EMAIL_ADDRESS = os.environ["EMAIL_ADDRESS"]
 EMAIL_APP_PASSWORD = os.environ["EMAIL_APP_PASSWORD"]
 TO_EMAIL = os.environ["TO_EMAIL"]
-
-# ------------------------------------------------
 
 
 def get_session():
@@ -41,6 +35,7 @@ def get_session():
 def fetch_page(session, url):
     response = session.get(url, timeout=30)
     response.raise_for_status()
+
     return response.text
 
 
@@ -55,151 +50,9 @@ def absolute_url(base_url, href):
     return urljoin(base_url, href)
 
 
-def get_job_links(html, base_url):
-    """
-    Find links from the latest-jobs page.
-
-    The selectors are intentionally broad because the exact HTML
-    structure of the website may change.
-    """
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    links = []
-
-    # Common WordPress / job-listing selectors.
-    selectors = [
-        "article a[href]",
-        ".entry-title a[href]",
-        ".post-title a[href]",
-        "h2 a[href]",
-        "h3 a[href]",
-        ".job-listing a[href]",
-        ".latest-jobs a[href]",
-        ".job-list a[href]",
-    ]
-
-    for selector in selectors:
-        for a in soup.select(selector):
-            href = a.get("href")
-            title = clean_text(a.get_text(" ", strip=True))
-
-            if not href or not title:
-                continue
-
-            full_url = absolute_url(base_url, href)
-
-            if full_url:
-                links.append((title, full_url))
-
-    # Fallback: collect links that look like job posts.
-    if not links:
-        for a in soup.find_all("a", href=True):
-            title = clean_text(a.get_text(" ", strip=True))
-            href = absolute_url(base_url, a["href"])
-
-            if not title or not href:
-                continue
-
-            if any(word in title.lower() for word in [
-                "recruitment", "vacancy", "job", "result",
-                "admit card", "answer key", "online form",
-                "notification"
-            ]):
-                links.append((title, href))
-
-    # Remove duplicates while preserving order.
-    unique = []
-    seen = set()
-
-    for title, url in links:
-        if url not in seen:
-            seen.add(url)
-            unique.append((title, url))
-
-    return unique
-
-
-def extract_job_details(html, url, fallback_title):
-    """
-    Extract readable text from an individual job page.
-
-    This is the first version. It does not yet use AI or OCR.
-    """
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Remove things that are not useful in the email.
-    for tag in soup(["script", "style", "noscript", "iframe"]):
-        tag.decompose()
-
-    title_tag = soup.find("h1")
-
-    title = clean_text(
-        title_tag.get_text(" ", strip=True)
-        if title_tag
-        else fallback_title
-    )
-
-    # Prefer the article content.
-    content = (
-        soup.select_one(".entry-content")
-        or soup.select_one(".post-content")
-        or soup.select_one("article")
-        or soup.body
-    )
-
-    text = clean_text(
-        content.get_text("\n", strip=True)
-        if content
-        else ""
-    )
-
-    # Limit extremely large pages.
-    text = text[:20000]
-
-    return {
-        "title": title,
-        "url": url,
-        "text": text,
-    }
-
-
-def extract_field(text, patterns):
-    """
-    Try to find a field such as last date, fee, or vacancies.
-    """
-
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-
-        if match:
-            return clean_text(match.group(1))
-
-    return "Not found"
-
-
-def extract_details(text):
-    return {
-        "vacancies": extract_field(text, [
-            r"(?:Total\s+)?(?:Number\s+of\s+)?Vacancies?\s*[:\-]?\s*([^\n]{1,100})",
-            r"Total\s+Posts?\s*[:\-]?\s*([^\n]{1,100})",
-            r"Total\s+Post\s*[:\-]?\s*([^\n]{1,100})",
-        ]),
-
-        "last_date": extract_field(text, [
-            r"Last\s+Date\s*[:\-]?\s*([^\n]{1,100})",
-            r"Last\s+Date\s+to\s+Apply\s*[:\-]?\s*([^\n]{1,100})",
-            r"Closing\s+Date\s*[:\-]?\s*([^\n]{1,100})",
-        ]),
-
-        "fee": extract_field(text, [
-            r"Application\s+Fee\s*[:\-]?\s*([^\n]{1,100})",
-            r"Exam\s+Fee\s*[:\-]?\s*([^\n]{1,100})",
-            r"Application\s+Fees?\s*[:\-]?\s*([^\n]{1,100})",
-        ]),
-    }
-
+# -------------------------------------------------
+# DATABASE
+# -------------------------------------------------
 
 def init_database():
     conn = sqlite3.connect(DB_FILE)
@@ -207,24 +60,25 @@ def init_database():
     conn.execute("""
         CREATE TABLE IF NOT EXISTS jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            url TEXT UNIQUE,
-            title TEXT,
-            first_seen TEXT,
+            url TEXT UNIQUE NOT NULL,
+            title TEXT NOT NULL,
+            first_seen TEXT NOT NULL,
             email_sent INTEGER DEFAULT 0
         )
     """)
 
     conn.commit()
+
     return conn
 
 
-def is_new_job(conn, url):
-    row = conn.execute(
-        "SELECT id FROM jobs WHERE url = ?",
+def job_exists(conn, url):
+    result = conn.execute(
+        "SELECT 1 FROM jobs WHERE url = ? LIMIT 1",
         (url,)
     ).fetchone()
 
-    return row is None
+    return result is not None
 
 
 def save_job(conn, title, url):
@@ -250,93 +104,351 @@ def mark_email_sent(conn, url):
     conn.commit()
 
 
-def build_email(job, details):
-    msg = EmailMessage()
+# -------------------------------------------------
+# FIND JOBS
+# -------------------------------------------------
 
-    msg["Subject"] = f"New Job: {job['title']}"
-    msg["From"] = EMAIL_ADDRESS
-    msg["To"] = TO_EMAIL
+def get_job_links(html, base_url):
+    soup = BeautifulSoup(html, "html.parser")
+
+    links = []
+
+    # These are the preferred selectors.
+    selectors = [
+        "article h2 a[href]",
+        "article h3 a[href]",
+        "article .entry-title a[href]",
+        "h2.entry-title a[href]",
+        "h3.entry-title a[href]",
+        ".entry-title a[href]",
+        ".post-title a[href]",
+    ]
+
+    for selector in selectors:
+        for a in soup.select(selector):
+
+            title = clean_text(
+                a.get_text(" ", strip=True)
+            )
+
+            href = a.get("href")
+
+            if not title or not href:
+                continue
+
+            url = absolute_url(base_url, href)
+
+            if url:
+                links.append((title, url))
+
+    # Remove duplicates.
+    unique = []
+    seen = set()
+
+    for title, url in links:
+
+        if url in seen:
+            continue
+
+        seen.add(url)
+        unique.append((title, url))
+
+    return unique
+
+
+# -------------------------------------------------
+# JOB PAGE
+# -------------------------------------------------
+
+def extract_job_page(html, url, fallback_title):
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Remove unnecessary elements.
+    for tag in soup([
+        "script",
+        "style",
+        "noscript",
+        "iframe",
+        "nav",
+        "footer"
+    ]):
+        tag.decompose()
+
+    title_element = soup.find("h1")
+
+    if title_element:
+        title = clean_text(
+            title_element.get_text(" ", strip=True)
+        )
+    else:
+        title = fallback_title
+
+    # Prefer article content.
+    content = (
+        soup.select_one(".entry-content")
+        or soup.select_one(".post-content")
+        or soup.select_one("article")
+        or soup.body
+    )
+
+    if content:
+        text = content.get_text("\n", strip=True)
+    else:
+        text = ""
+
+    # Clean excessive blank lines.
+    lines = []
+
+    for line in text.splitlines():
+        line = clean_text(line)
+
+        if line:
+            lines.append(line)
+
+    text = "\n".join(lines)
+
+    return {
+        "title": title,
+        "url": url,
+        "text": text[:30000]
+    }
+
+
+# -------------------------------------------------
+# INFORMATION EXTRACTION
+# -------------------------------------------------
+
+def find_field(text, patterns):
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            text,
+            re.IGNORECASE
+        )
+
+        if match:
+            value = clean_text(match.group(1))
+
+            if value:
+                return value
+
+    return "Not found"
+
+
+def extract_information(text):
+
+    vacancies = find_field(text, [
+        r"Total\s+(?:Number\s+of\s+)?Vacancies?\s*[:\-]?\s*([^\n]+)",
+        r"Total\s+Posts?\s*[:\-]?\s*([^\n]+)",
+        r"Total\s+Post\s*[:\-]?\s*([^\n]+)",
+        r"No\.?\s+of\s+Posts?\s*[:\-]?\s*([^\n]+)",
+    ])
+
+    fee = find_field(text, [
+        r"Application\s+Fee\s*[:\-]?\s*([^\n]+)",
+        r"Application\s+Fees?\s*[:\-]?\s*([^\n]+)",
+        r"Exam\s+Fee\s*[:\-]?\s*([^\n]+)",
+    ])
+
+    last_date = find_field(text, [
+        r"Last\s+Date\s+(?:to\s+Apply)?\s*[:\-]?\s*([^\n]+)",
+        r"Closing\s+Date\s*[:\-]?\s*([^\n]+)",
+        r"Apply\s+Online\s+Last\s+Date\s*[:\-]?\s*([^\n]+)",
+    ])
+
+    start_date = find_field(text, [
+        r"Application\s+Start\s+Date\s*[:\-]?\s*([^\n]+)",
+        r"Start\s+Date\s*[:\-]?\s*([^\n]+)",
+        r"Online\s+Form\s+Start\s+Date\s*[:\-]?\s*([^\n]+)",
+    ])
+
+    return {
+        "vacancies": vacancies,
+        "fee": fee,
+        "last_date": last_date,
+        "start_date": start_date,
+    }
+
+
+# -------------------------------------------------
+# EMAIL
+# -------------------------------------------------
+
+def create_email(job, information):
+
+    subject = f"New Job Alert: {job['title']}"
 
     body = f"""
-New job notification
+NEW JOB NOTIFICATION
+====================
 
-Job Name:
+Job:
 {job['title']}
 
 Total Vacancies:
-{details['vacancies']}
+{information['vacancies']}
 
 Application Fee:
-{details['fee']}
+{information['fee']}
+
+Application Start Date:
+{information['start_date']}
 
 Last Date:
-{details['last_date']}
+{information['last_date']}
 
-Official Notification / Job Page:
+
+JOB / NOTIFICATION PAGE
+=======================
+
 {job['url']}
 
-Eligibility Criteria:
-The full extracted notification text is included below.
 
---------------------------------------------------
+ELIGIBILITY / NOTIFICATION DETAILS
+===================================
 
 {job['text']}
+
+
+-------------------------------------------------
+This notification was automatically generated.
 """
 
-    msg.set_content(body)
+    message = EmailMessage()
 
-    return msg
+    message["Subject"] = subject
+    message["From"] = EMAIL_ADDRESS
+    message["To"] = TO_EMAIL
+
+    message.set_content(body)
+
+    return message
 
 
-def send_email(msg):
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
-        server.send_message(msg)
+def send_email(message):
 
+    print("Connecting to Gmail...")
+
+    with smtplib.SMTP_SSL(
+        "smtp.gmail.com",
+        465
+    ) as server:
+
+        server.login(
+            EMAIL_ADDRESS,
+            EMAIL_APP_PASSWORD
+        )
+
+        server.send_message(message)
+
+    print("Email sent successfully.")
+
+
+# -------------------------------------------------
+# MAIN
+# -------------------------------------------------
 
 def main():
+
+    print("=" * 60)
+    print("SARKARI RESULT JOB MONITOR")
+    print("=" * 60)
+
     session = get_session()
+
     conn = init_database()
 
-    print("Checking latest jobs...")
+    print("\nChecking:")
+    print(LATEST_JOBS_URL)
 
-    latest_html = fetch_page(session, LATEST_JOBS_URL)
-    job_links = get_job_links(latest_html, LATEST_JOBS_URL)
+    latest_html = fetch_page(
+        session,
+        LATEST_JOBS_URL
+    )
 
-    print(f"Found {len(job_links)} job links.")
+    jobs = get_job_links(
+        latest_html,
+        LATEST_JOBS_URL
+    )
 
-    for title, url in job_links:
+    print(f"\nFound {len(jobs)} possible job posts.")
 
-        if not is_new_job(conn, url):
+    new_jobs = 0
+
+    for index, (title, url) in enumerate(jobs, start=1):
+
+        print(
+            f"\n[{index}/{len(jobs)}] {title}"
+        )
+
+        if job_exists(conn, url):
+
+            print("Already processed.")
+
             continue
 
-        print(f"New job found: {title}")
+        print("NEW JOB!")
 
         try:
-            job_html = fetch_page(session, url)
 
-            job = extract_job_details(
+            job_html = fetch_page(
+                session,
+                url
+            )
+
+            job = extract_job_page(
                 job_html,
                 url,
                 title
             )
 
-            details = extract_details(job["text"])
+            information = extract_information(
+                job["text"]
+            )
 
-            save_job(conn, job["title"], url)
+            print(
+                f"Vacancies: {information['vacancies']}"
+            )
 
-            msg = build_email(job, details)
+            print(
+                f"Last date: {information['last_date']}"
+            )
 
-            send_email(msg)
+            # Save BEFORE sending.
+            # This prevents the same URL from being
+            # processed repeatedly.
+            save_job(
+                conn,
+                job["title"],
+                url
+            )
 
-            mark_email_sent(conn, url)
+            email = create_email(
+                job,
+                information
+            )
 
-            print("Email sent.")
+            send_email(email)
 
-        except Exception as e:
-            print(f"Error processing {url}: {e}")
+            mark_email_sent(
+                conn,
+                url
+            )
+
+            new_jobs += 1
+
+        except Exception as error:
+
+            print(
+                f"ERROR: {error}"
+            )
 
     conn.close()
+
+    print("\n" + "=" * 60)
+    print(f"New jobs emailed: {new_jobs}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
