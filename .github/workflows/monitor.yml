@@ -8,6 +8,11 @@ on:
 
   # Allows you to run it manually
   workflow_dispatch:
+   inputs:
+    test_url:
+      description: "Job URL to test (leave empty for normal monitoring)"
+      required: false
+      type: string
 
 permissions:
   contents: write
@@ -35,11 +40,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+
+
       - name: Run job monitor
         env:
           EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
           TO_EMAIL: ${{ secrets.TO_EMAIL }}
+          TEST_URL: ${{ github.event.inputs.test_url }}
         run: |
           python scraper.py
 
