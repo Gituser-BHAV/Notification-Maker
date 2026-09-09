@@ -1,18 +1,29 @@
 name: Job Monitor
 
 on:
+
+  # Run every hour
   schedule:
     - cron: "0 * * * *"
 
+  # Allows you to run it manually
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
+
   monitor:
+
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -20,18 +31,29 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Run job monitor
         env:
           EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
           TO_EMAIL: ${{ secrets.TO_EMAIL }}
-        run: python scraper.py
+        run: |
+          python scraper.py
 
+      # Save jobs.db permanently in the repository
       - name: Save database
-        uses: actions/upload-artifact@v4
-        with:
-          name: jobs-database
-          path: jobs.db
-          retention-days: 90
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add jobs.db
+
+          if git diff --cached --quiet; then
+            echo "No database changes."
+          else
+            git commit -m "Update job monitor database"
+            git push
+          fi
