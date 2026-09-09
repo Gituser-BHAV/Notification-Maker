@@ -638,28 +638,33 @@ def extract_application_fee(container):
 DATE_LABELS = {
     "start": [
         "application start date",
-        "application start",
-        "start date",
+        "online application start date",
         "online application start",
+        "application start",
         "form start date",
+        "start date",
     ],
 
     "last": [
-        "last date",
-        "last date to apply",
+        "last date for apply online",
+        "last date to apply online",
         "application last date",
+        "last date to apply",
+        "last date",
         "closing date",
     ],
 
     "fee": [
         "fee payment last date",
-        "fee payment date",
         "last date for fee payment",
+        "fee payment date",
+        "last date of fee payment",
     ],
 
     "correction": [
         "correction date",
         "correction window",
+        "online correction date",
         "online correction",
         "application correction",
     ],
@@ -671,8 +676,8 @@ DATE_LABELS = {
     ],
 
     "admit": [
-        "admit card",
         "admit card date",
+        "admit card",
     ],
 
     "result": [
@@ -681,8 +686,18 @@ DATE_LABELS = {
     ],
 }
 
-
 def find_label_value(lines, labels):
+    # Check longer labels first so:
+    # "Last Date for Fee Payment"
+    # does not get incorrectly matched as:
+    # "Last Date"
+
+    labels = sorted(
+        labels,
+        key=len,
+        reverse=True
+    )
+
     for i, line in enumerate(lines):
 
         normalized = normalize_label(line)
@@ -698,14 +713,21 @@ def find_label_value(lines, labels):
                 ].strip(" :-")
 
                 if value:
+                    # Remove extra wording such as:
+                    # "for Apply Online : District Wise"
+                    value = re.sub(
+                        r"^for\s+apply\s+online\s*[:\-]?\s*",
+                        "",
+                        value,
+                        flags=re.I
+                    )
+
                     return value
 
                 if i + 1 < len(lines):
                     return lines[i + 1]
 
     return None
-
-
 def extract_dates(container):
     result = {
         "start": "Not found",
@@ -1746,7 +1768,14 @@ def test_single_url(url):
         return
 
     try:
-        job = extract_job_page(url, page)
+        job = extract_job_page(
+            url,
+            page
+        )
+
+        # ----------------------------------------------------
+        # Console output
+        # ----------------------------------------------------
 
         print(f"Job Name:\n{job['title']}")
         print()
@@ -1767,52 +1796,99 @@ def test_single_url(url):
         print(f"Application Fee:\n{job['fee']}")
         print()
 
-        print(f"Application Start Date:\n{job['start_date']}")
+        print(
+            f"Application Start Date:\n"
+            f"{job['start_date']}"
+        )
         print()
 
-        print(f"Last Date:\n{job['last_date']}")
+        print(
+            f"Last Date:\n"
+            f"{job['last_date']}"
+        )
         print()
 
-        print(f"Fee Payment Date:\n{job['fee_date']}")
+        print(
+            f"Fee Payment Date:\n"
+            f"{job['fee_date']}"
+        )
         print()
 
-        print(f"Correction Date:\n{job['correction_date']}")
+        print(
+            f"Correction Date:\n"
+            f"{job['correction_date']}"
+        )
         print()
 
-        print(f"Exam Date:\n{job['exam_date']}")
+        print(
+            f"Exam Date:\n"
+            f"{job['exam_date']}"
+        )
         print()
 
-        print(f"Admit Card:\n{job['admit_card']}")
+        print(
+            f"Admit Card:\n"
+            f"{job['admit_card']}"
+        )
         print()
 
-        print(f"Result:\n{job['result_date']}")
+        print(
+            f"Result:\n"
+            f"{job['result_date']}"
+        )
         print()
 
-        print(f"Apply Online:\n{job['apply']}")
+        print(
+            f"Apply Online:\n"
+            f"{job['apply']}"
+        )
         print()
 
-        print(f"Official Notification:\n{job['notification']}")
+        print(
+            f"Official Notification:\n"
+            f"{job['notification']}"
+        )
         print()
 
-        print(f"Online Correction:\n{job['correction']}")
+        print(
+            f"Online Correction:\n"
+            f"{job['correction']}"
+        )
         print()
 
-        print(f"Official Website:\n{job['website']}")
+        print(
+            f"Official Website:\n"
+            f"{job['website']}"
+        )
         print()
 
-        print(f"Job Page:\n{job['job_page']}")
+        print(
+            f"Job Page:\n"
+            f"{job['job_page']}"
+        )
         print()
+
+        # ----------------------------------------------------
+        # REAL EMAIL TEST
+        # ----------------------------------------------------
 
         print("=" * 60)
-        print("TEST COMPLETE")
-        print("No email was sent.")
-        print("Database was not modified.")
+        print("Sending test email...")
+        print("=" * 60)
+
+        send_email(job)
+
+        print()
+        print("TEST EMAIL SENT SUCCESSFULLY.")
+        print()
+        print("Database was NOT modified.")
         print("=" * 60)
 
     except Exception as e:
-        print(f"Test failed: {e}")
 
-
+        print(
+            f"Test failed: {e}"
+        )
 
 def main():
 
