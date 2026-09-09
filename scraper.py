@@ -374,6 +374,11 @@ def main():
 
     print(f"\nFound {len(jobs)} possible job posts.")
 
+    if len(jobs) == 0:
+        print("\nDEBUG: No jobs found.")
+        print("Page title:", BeautifulSoup(latest_html, "html.parser").title)
+        print("\nFirst 5000 characters of HTML:")
+        print(latest_html[:5000])
     new_jobs = 0
 
     for index, (title, url) in enumerate(jobs, start=1):
