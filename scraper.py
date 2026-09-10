@@ -3,7 +3,7 @@ import re
 import sqlite3
 import smtplib
 import html
-from datetime import datetime
+from datetime import datetime, date
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from urllib.parse import urljoin, urlparse
@@ -11,7 +11,119 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup, Tag
 
+# ============================================================
+# New Code
+# ============================================================
+def parse_last_date(text):
+    """
+    Extract the application last date from job text.
 
+    Supported examples:
+    31/12/2026
+    31-12-2026
+    31.12.2026
+    31 December 2026
+    31 Dec 2026
+    """
+
+    if not text:
+        return None
+
+    text = re.sub(r"\s+", " ", text)
+
+    # Only search near application/deadline wording.
+    deadline_keywords = [
+        "last date",
+        "last date to apply",
+        "application last date",
+        "online application",
+        "apply online till",
+        "closing date",
+        "application deadline",
+        "registration last date",
+    ]
+
+    keyword_pattern = "|".join(
+        re.escape(keyword) for keyword in deadline_keywords
+    )
+
+    # Capture a reasonable section after a deadline keyword.
+    match = re.search(
+        rf"(?:{keyword_pattern}).{{0,120}}",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    if not match:
+        return None
+
+    deadline_text = match.group(0)
+
+    # Numeric date formats: 31/12/2026, 31-12-2026, 31.12.2026
+    numeric_match = re.search(
+        r"\b(0?[1-9]|[12][0-9]|3[01])\s*[/\-.]\s*"
+        r"(0?[1-9]|1[0-2])\s*[/\-.]\s*(20\d{2})\b",
+        deadline_text,
+        flags=re.IGNORECASE,
+    )
+
+    if numeric_match:
+        day, month, year = map(int, numeric_match.groups())
+
+        try:
+            return date(year, month, day)
+        except ValueError:
+            return None
+
+    # Text date formats: 31 December 2026 / 31 Dec 2026
+    month_names = (
+        "January|February|March|April|May|June|July|August|"
+        "September|October|November|December|"
+        "Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec"
+    )
+
+    text_match = re.search(
+        rf"\b(0?[1-9]|[12][0-9]|3[01])\s+"
+        rf"({month_names})\s+(20\d{{2}})\b",
+        deadline_text,
+        flags=re.IGNORECASE,
+    )
+
+    if text_match:
+        day = int(text_match.group(1))
+        month_text = text_match.group(2)
+        year = int(text_match.group(3))
+
+        for fmt in ("%d %B %Y", "%d %b %Y"):
+            try:
+                return datetime.strptime(
+                    f"{day} {month_text} {year}",
+                    fmt,
+                ).date()
+            except ValueError:
+                continue
+
+    return None
+# ============================================================
+# Filter Function
+# ============================================================
+def is_expired_job(job_text):
+    """
+    Returns True when the job's application deadline
+    is before today's date.
+    """
+
+    last_date = parse_last_date(job_text)
+
+    # If no deadline was found, do not automatically reject it.
+    # This prevents valid jobs from being discarded because
+    # the website uses an unusual date format.
+    if last_date is None:
+        return False
+
+    today = date.today()
+
+    return last_date < today
 # ============================================================
 # CONFIG
 # ============================================================
@@ -1982,9 +2094,31 @@ def main():
             )
 
             print(
-                f"Last: "
+                f"Last : "
                 f"{job['last_date']}"
             )
+            # ----------------------------------------------------
+            # DEADLINE FILTER TEST
+            # ----------------------------------------------------
+
+            if is_expired_job(job["last_date"]):
+
+                print("=" * 60)
+                print("EXPIRED JOB")
+                print("=" * 60)
+                print(
+                    f"Last date: {job['last_date']}"
+                )    
+                print(
+                    "Email will NOT be sent."
+                )
+                print("=" * 60)
+
+                return
+
+            print("=" * 60)
+            print("JOB IS STILL OPEN")
+            print("=" * 60)
 
             # ------------------------------------------------
             # Send email FIRST.
