@@ -14,114 +14,107 @@ from bs4 import BeautifulSoup, Tag
 # ============================================================
 # New Code
 # ============================================================
+# ============================================================
+# DEADLINE FILTER
+# ============================================================
+
 def parse_last_date(text):
     """
-    Extract the application last date from job text.
+    Convert an extracted last-date value into a Python date.
 
-    Supported examples:
-    31/12/2026
-    31-12-2026
-    31.12.2026
-    31 December 2026
-    31 Dec 2026
+    Examples supported:
+        05 February 2025
+        05 Feb 2025
+        05/02/2025
+        05-02-2025
+        05.02.2025
+        5 February 2025
+        5 Feb 2025
     """
 
     if not text:
         return None
 
-    text = re.sub(r"\s+", " ", text)
+    text = str(text).strip()
 
-    # Only search near application/deadline wording.
-    deadline_keywords = [
-        "last date",
-        "last date to apply",
-        "application last date",
-        "online application",
-        "apply online till",
-        "closing date",
-        "application deadline",
-        "registration last date",
-    ]
-
-    keyword_pattern = "|".join(
-        re.escape(keyword) for keyword in deadline_keywords
-    )
-
-    # Capture a reasonable section after a deadline keyword.
-    match = re.search(
-        rf"(?:{keyword_pattern}).{{0,120}}",
-        text,
-        flags=re.IGNORECASE,
-    )
-
-    if not match:
+    # Values that are not actual dates
+    if text.lower() in [
+        "not found",
+        "district wise",
+        "district-wise",
+        "notify soon",
+        "will be updated",
+        "to be announced",
+        "tba",
+        "n/a",
+        "na",
+    ]:
         return None
 
-    deadline_text = match.group(0)
-
-    # Numeric date formats: 31/12/2026, 31-12-2026, 31.12.2026
-    numeric_match = re.search(
-        r"\b(0?[1-9]|[12][0-9]|3[01])\s*[/\-.]\s*"
-        r"(0?[1-9]|1[0-2])\s*[/\-.]\s*(20\d{2})\b",
-        deadline_text,
-        flags=re.IGNORECASE,
+    # Remove common ordinal suffixes:
+    # 1st, 2nd, 3rd, 4th
+    text = re.sub(
+        r"\b(\d{1,2})(st|nd|rd|th)\b",
+        r"\1",
+        text,
+        flags=re.IGNORECASE
     )
 
-    if numeric_match:
-        day, month, year = map(int, numeric_match.groups())
+    text = re.sub(r"\s+", " ", text).strip()
 
+    formats = [
+        "%d %B %Y",
+        "%d %b %Y",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+        "%d.%m.%Y",
+        "%d/%m/%y",
+        "%d-%m-%y",
+        "%d.%m.%y",
+    ]
+
+    for fmt in formats:
         try:
-            return date(year, month, day)
+            return datetime.strptime(
+                text,
+                fmt
+            ).date()
         except ValueError:
-            return None
-
-    # Text date formats: 31 December 2026 / 31 Dec 2026
-    month_names = (
-        "January|February|March|April|May|June|July|August|"
-        "September|October|November|December|"
-        "Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec"
-    )
-
-    text_match = re.search(
-        rf"\b(0?[1-9]|[12][0-9]|3[01])\s+"
-        rf"({month_names})\s+(20\d{{2}})\b",
-        deadline_text,
-        flags=re.IGNORECASE,
-    )
-
-    if text_match:
-        day = int(text_match.group(1))
-        month_text = text_match.group(2)
-        year = int(text_match.group(3))
-
-        for fmt in ("%d %B %Y", "%d %b %Y"):
-            try:
-                return datetime.strptime(
-                    f"{day} {month_text} {year}",
-                    fmt,
-                ).date()
-            except ValueError:
-                continue
+            continue
 
     return None
-# ============================================================
-# Filter Function
-# ============================================================
-def is_expired_job(job_text):
+
+
+def is_expired_job(last_date_text):
     """
-    Returns True when the job's application deadline
-    is before today's date.
+    Returns True if the application deadline has passed.
+
+    A missing/unrecognized deadline is also rejected for safety.
     """
 
-    last_date = parse_last_date(job_text)
+    if not last_date_text:
+        return True
 
-    # If no deadline was found, do not automatically reject it.
-    # This prevents valid jobs from being discarded because
-    # the website uses an unusual date format.
+    last_date = parse_last_date(
+        last_date_text
+    )
+
     if last_date is None:
-        return False
+        print(
+            f"Could not parse application deadline: "
+            f"{last_date_text}"
+        )
+
+        # Do not send jobs when we cannot determine
+        # whether the application is still open.
+        return True
 
     today = date.today()
+
+    print(
+        f"Deadline check: "
+        f"{last_date} | Today: {today}"
+    )
 
     return last_date < today
 # ============================================================
@@ -1981,6 +1974,32 @@ def test_single_url(url):
         print()
 
         # ----------------------------------------------------
+        # DEADLINE FILTER
+        # ----------------------------------------------------
+
+        if is_expired_job(job["last_date"]):
+
+            print("=" * 60)
+            print("EXPIRED / INVALID JOB")
+            print("=" * 60)
+
+            print(
+                f"Last Date: {job['last_date']}"
+            )
+
+            print(
+                "Test email will NOT be sent."
+            )
+
+            print("=" * 60)
+
+            return
+
+
+        print("=" * 60)
+        print("JOB PASSED DEADLINE FILTER")
+        print("=" * 60)
+        # ----------------------------------------------------
         # REAL EMAIL TEST
         # ----------------------------------------------------
 
@@ -2114,7 +2133,7 @@ def main():
                 )
                 print("=" * 60)
 
-                return
+                continue
 
             print("=" * 60)
             print("JOB IS STILL OPEN")
