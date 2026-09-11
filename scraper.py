@@ -791,7 +791,7 @@ DATE_LABELS = {
     ],
 }
 
-def find_label_value(lines, labels):
+def find_label_value(lines, labels, field=None):
     # Check longer labels first so:
     # "Last Date for Fee Payment"
     # does not get incorrectly matched as:
@@ -812,6 +812,15 @@ def find_label_value(lines, labels):
             label_norm = normalize_label(label)
 
             if normalized.startswith(label_norm):
+
+                # Do not treat fee-payment deadlines as application deadlines.
+                if (
+                    "fee payment" in normalized
+                    or "payment of fee" in normalized
+                    or "fee" in normalized
+                    and "last date" in normalized
+                ):
+                    continue
 
                 value = line[
                     len(label_norm):
@@ -880,7 +889,8 @@ def extract_dates(container):
 
         value = find_label_value(
             lines,
-            labels
+            labels,
+            field=key
         )
 
         if value:
@@ -918,7 +928,11 @@ def extract_dates(container):
                 result["start"] = dates[0]
 
         if result["last"] == "Not found":
-            if "last date" in lower:
+            if (
+                "last date" in lower
+                and "fee payment" not in lower
+                and "payment of fee" not in lower
+            ):
                 result["last"] = dates[-1]
 
     # --------------------------------------------------------
